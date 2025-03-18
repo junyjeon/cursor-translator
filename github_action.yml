@@ -1,0 +1,41 @@
+name: Update Cursor Translations
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # 매주 일요일 실행
+  workflow_dispatch:  # 수동 실행 가능
+
+jobs:
+  translate:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+      
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.9'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests
+        
+    - name: Download latest Cursor version
+      run: |
+        # Cursor 최신 버전 다운로드 로직 구현
+        # (GitHub에서 최신 릴리스 가져오기)
+        
+    - name: Extract strings and translate
+      env:
+        DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
+      run: |
+        python main.py --api-key $DEEPL_API_KEY --langs "ko,ja,zh,fr,de,es,it,pt,ru" --no-backup
+        
+    - name: Commit and push changes
+      uses: EndBug/add-and-commit@v9
+      with:
+        add: 'cursor_translations_*.json cursor_strings.txt'
+        message: 'Update translations for latest Cursor version'
