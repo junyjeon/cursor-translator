@@ -7,12 +7,20 @@ import datetime
 from pathlib import Path
 import argparse
 import sys
+import logging
+
+# 모듈 경로 추가
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # 모듈 임포트
-from cursor_finder import find_cursor_installation, find_main_js_file, find_settings_json
+from cursor_finder import CursorFinder, find_main_js_file, find_settings_json
 from cursor_backup import backup_cursor_files
-from cursor_extractor import extract_ui_strings, save_extracted_strings, load_previous_translations, get_new_strings_for_translation
+from cursor_extractor import CursorExtractor, extract_ui_strings, save_extracted_strings, load_previous_translations, get_new_strings_for_translation
 from cursor_translator import DeepLTranslator, save_translations, update_translations, load_translations
+
+# 로깅 설정
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class CursorTranslator:
     def __init__(self, deepl_api_key=None, cursor_path=None):
@@ -278,210 +286,279 @@ class CursorTranslationApp:
         with open('cursor_translator_app.py', 'w', encoding='utf-8') as f:
             f.write(app_code)
 
-def main():
-    parser = argparse.ArgumentParser(description='Cursor IDE 다국어 번역 도구')
-    parser.add_argument('--api-key', help='DeepL API 키 (없으면 기존 번역 또는 샘플 사용)')
-    parser.add_argument('--langs', default='ko', help='번역할 언어 코드 (쉼표로 구분, 기본값: ko)')
-    parser.add_argument('--no-backup', action='store_true', help='백업 건너뛰기')
-    parser.add_argument('--cursor-path', help='Cursor 설치 경로 수동 지정')
-    parser.add_argument('--extract-only', action='store_true', help='텍스트만 추출하고 번역은 건너뛰기')
-    parser.add_argument('--view-only', action='store_true', help='기존 번역만 표시 (추출/번역 건너뛰기)')
-    parser.add_argument('--test-mode', action='store_true', help='Cursor 설치 없이 샘플 데이터로 테스트')
-    args = parser.parse_args()
-    
-    # 기존 번역 파일만 볼 경우
-    if args.view_only:
-        print("기존 번역 파일 확인 중...")
-        languages = [lang.strip() for lang in args.langs.split(',')]
+def create_backup(cursor_path, js_file_path):
+    """원본 파일 백업"""
+    if not cursor_path or not js_file_path or not os.path.exists(js_file_path):
+        logger.error("백업을 위한 파일 경로가 유효하지 않습니다.")
+        return None
         
-        for lang in languages:
-            translations = load_translations(lang)
-            if translations:
-                print(f"[{lang}] {len(translations)}개 번역 항목 찾음")
-            else:
-                print(f"[{lang}] 번역 파일이 없거나 비어 있습니다.")
+    # 백업 디렉토리 생성
+    backup_dir = Path.home() / '.cursor_translator' / 'backups'
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 타임스탬프로 백업 파일 이름 생성
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_file = backup_dir / f"workbench.desktop.main.js.{timestamp}"
+    
+    try:
+        shutil.copy2(js_file_path, backup_file)
+        logger.info(f"원본 파일 백업 완료: {backup_file}")
+        return backup_file
+    except Exception as e:
+        logger.error(f"백업 생성 중 오류 발생: {e}")
+        return None
+
+def restore_backup(backup_file, js_file_path):
+    """백업에서 복원"""
+    if not backup_file or not js_file_path:
+        logger.error("복원을 위한 파일 경로가 유효하지 않습니다.")
+        return False
         
-        print("\n번역 파일은 'cursor_translations_[언어코드].json' 형식으로 저장되어 있습니다.")
-        return
+    try:
+        shutil.copy2(backup_file, js_file_path)
+        logger.info(f"백업에서 복원 완료: {js_file_path}")
+        return True
+    except Exception as e:
+        logger.error(f"복원 중 오류 발생: {e}")
+        return False
+
+def apply_translations(js_file_path, translation_file, backup=True):
+    """번역 적용"""
+    if not js_file_path or not os.path.exists(js_file_path):
+        logger.error(f"JS 파일이 존재하지 않습니다: {js_file_path}")
+        return False
+        
+    if not translation_file or not os.path.exists(translation_file):
+        logger.error(f"번역 파일이 존재하지 않습니다: {translation_file}")
+        return False
     
-    # 1. Cursor 관련 파일 경로 찾기
-    print("1. Cursor IDE 경로 찾는 중...")
-    cursor_path = Path(args.cursor_path) if args.cursor_path else find_cursor_installation()
+    # 번역 파일 로드
+    try:
+        with open(translation_file, 'r', encoding='utf-8') as f:
+            translations = json.load(f)
+    except Exception as e:
+        logger.error(f"번역 파일 로드 중 오류 발생: {e}")
+        return False
     
-    # 테스트 모드 확인
-    if not cursor_path and args.test_mode:
-        print("테스트 모드: Cursor 설치 없이 샘플 데이터만 사용합니다.")
-        # 샘플 번역 생성
-        sample_texts = [
-            "A powerful Copilot replacement that can suggest changes across multiple lines.",
-            "If on, none of your code will be stored by us.",
-            "Enable or disable Cursor Tab suggestions in comments",
-            "Auto-scroll to bottom",
-            "Allow Agent to run tools without asking for confirmation",
-            "Cursor Settings",
-            "Account",
-            "Features",
-            "Models",
-            "Rules",
-            "General",
-            "VS Code Import",
-            "Appearance",
-            "Cursor Tab",
-            "Chat"
+    # 원본 파일 로드
+    try:
+        with open(js_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+    except Exception as e:
+        logger.error(f"JS 파일 로드 중 오류 발생: {e}")
+        return False
+    
+    # 백업 생성
+    if backup:
+        cursor_path = js_file_path.parents[4]  # 'resources/app/out/vs/workbench' 상위 디렉토리
+        create_backup(cursor_path, js_file_path)
+    
+    # 번역 적용 (정규식으로 찾아 바꾸기)
+    modified_content = content
+    replacements = 0
+    
+    # 번역 사전 정렬 (길이가 긴 텍스트부터 처리)
+    sorted_translations = sorted(translations.items(), key=lambda x: len(x[0]), reverse=True)
+    
+    for original, translated in sorted_translations:
+        if not translated:  # 번역이 없는 항목은 건너뛰기
+            continue
+            
+        # 원본이 너무 짧으면 건너뛰기 (오탐지 방지)
+        if len(original) < 3:
+            continue
+        
+        # 치환 패턴 생성
+        patterns = [
+            f'"{original}"',  # "텍스트"
+            f"'{original}'",  # '텍스트'
         ]
         
-        # 샘플 문자열 저장
-        strings_file = Path("cursor_strings.txt")
-        save_extracted_strings(sample_texts, strings_file)
-        print(f"   - 샘플 문자열 저장됨: {strings_file}")
-        
-        # 번역 처리로 건너뛰기
-        print("\n2. 샘플 문자열 번역 중...")
-        translator = DeepLTranslator(args.api_key)
-        
-        # 번역할 언어 목록
-        languages = [lang.strip() for lang in args.langs.split(',') if lang.strip() in translator.supported_languages]
-        
-        for lang in languages:
-            print(f"\n   - {translator.supported_languages.get(lang, lang)} 번역 시작...")
-            new_translations = translator.translate_texts(sample_texts, lang)
-            
-            if new_translations:
-                # 번역 결과 저장
-                translations_file = Path(f"cursor_translations_{lang}.json")
-                update_translations(translations_file, new_translations)
-                print(f"     - {len(new_translations)}개 문자열 번역 완료: {translations_file}")
-        
-        print("\n테스트 모드 작업이 완료되었습니다!")
-        print("생성된 번역 파일을 확인하세요.")
-        return
-    
-    if not cursor_path:
-        print("Cursor IDE 설치 경로를 찾을 수 없습니다.")
-        print("수동으로 경로를 지정하려면 --cursor-path 옵션을 사용하세요.")
-        print("또는 --test-mode 옵션을 사용하여 Cursor 설치 없이 샘플 데이터로 테스트할 수 있습니다.")
-        sys.exit(1)
-    
-    # 2. 필요한 파일 찾기
-    main_js_path = find_main_js_file(cursor_path)
-    settings_path = find_settings_json()
-    
-    if not main_js_path:
-        print("workbench.desktop.main.js 파일을 찾을 수 없습니다.")
-        sys.exit(1)
-    
-    print(f"   - main.js 경로: {main_js_path}")
-    print(f"   - settings.json 경로: {settings_path if settings_path and settings_path.exists() else '찾을 수 없음'}")
-    
-    # 3. 파일 백업
-    if not args.no_backup:
-        print("\n2. 중요 파일 백업 중...")
-        backup_dir = backup_cursor_files(main_js_path, settings_path)
-        if backup_dir:
-            print(f"   - 백업 완료: {backup_dir}")
-        else:
-            print("   - 백업 실패 또는 파일 없음")
-    
-    # 4. UI 문자열 추출
-    print("\n3. UI 문자열 추출 중...")
-    extracted_strings = extract_ui_strings(main_js_path)
-    
-    if not extracted_strings:
-        print("   - 추출할 UI 문자열이 없습니다.")
-        sys.exit(1)
-    
-    print(f"   - {len(extracted_strings)}개 문자열 추출됨")
-    
-    # 추출된 문자열 저장
-    strings_file = Path("cursor_strings.txt")
-    save_extracted_strings(extracted_strings, strings_file)
-    print(f"   - 추출된 문자열 저장됨: {strings_file}")
-    
-    # 추출만 원하는 경우 종료
-    if args.extract_only:
-        print("\n문자열 추출이 완료되었습니다. 추출된 문자열은 cursor_strings.txt 파일에서 확인하세요.")
-        return
-    
-    # 5. 번역 처리
-    print("\n4. 문자열 번역 중...")
-    translator = DeepLTranslator(args.api_key)
-    
-    # 번역할 언어 목록
-    languages = [lang.strip() for lang in args.langs.split(',') if lang.strip() in translator.supported_languages]
-    
-    if not languages:
-        print("   - 지원되는 언어가 지정되지 않았습니다.")
-        print(f"   - 지원 언어: {', '.join(translator.supported_languages.keys())}")
-        sys.exit(1)
-    
-    for lang in languages:
-        print(f"\n   - {translator.supported_languages.get(lang, lang)} 번역 시작...")
-        
-        # 이전 번역 로드
-        translations_file = Path(f"cursor_translations_{lang}.json")
-        prev_translations = load_previous_translations(translations_file)
-        
-        # 새로운 문자열만 필터링
-        new_strings = get_new_strings_for_translation(extracted_strings, prev_translations)
-        
-        if not new_strings:
-            print(f"     - 모든 문자열이 이미 번역되어 있습니다.")
-            continue
-        
-        print(f"     - {len(new_strings)}개 새 문자열 번역 중...")
-        
-        # 번역 처리
-        new_translations = translator.translate_texts(new_strings, lang)
-        
-        if not new_translations:
-            if not args.api_key:
-                print(f"     - DeepL API 키가 없어 샘플 또는 기존 번역만 사용합니다.")
+        for pattern in patterns:
+            # 치환할 번역문 생성
+            if "'" in pattern:
+                replacement = f"'{translated}'"
             else:
-                print(f"     - 번역 실패 또는 결과 없음")
-            continue
-        
-        # 번역 결과 업데이트 및 저장
-        updated = update_translations(translations_file, new_translations)
-        print(f"     - {updated}개 문자열 번역 완료: {translations_file}")
+                replacement = f'"{translated}"'
+                
+            # 치환 횟수 카운트
+            old_content = modified_content
+            modified_content = modified_content.replace(pattern, replacement)
+            if old_content != modified_content:
+                replacements += 1
     
-    print("\n작업이 완료되었습니다!")
-    print("번역 파일을 확인하고 필요에 따라 수정하세요.")
-    print("\n사용 방법:")
-    print("- 번역 파일: cursor_translations_[언어코드].json")
-    print("- 추출된 문자열: cursor_strings.txt")
-    
-    # API 키가 없는 경우 안내 메시지
-    if not args.api_key:
-        print("\n참고: DeepL API 키가 제공되지 않아 샘플 또는 기존 번역만 사용했습니다.")
-        print("정확한 번역을 위해 DeepL API 키를 사용할 수 있습니다: https://www.deepl.com/pro#developer")
+    # 변경된 내용 저장
+    if replacements > 0:
+        try:
+            with open(js_file_path, 'w', encoding='utf-8') as f:
+                f.write(modified_content)
+            logger.info(f"번역 적용 완료: {replacements}개 항목 적용됨")
+            return True
+        except Exception as e:
+            logger.error(f"변경된 내용 저장 중 오류 발생: {e}")
+            return False
+    else:
+        logger.warning("적용된 번역이 없습니다.")
+        return False
 
-def show_usage():
-    """사용법 표시"""
-    print("Cursor IDE 다국어 번역 도구 사용법:")
-    print("\n기본 사용법:")
-    print("  python main.py")
-    print("\n옵션:")
-    print("  --api-key KEY      : DeepL API 키 (새 번역 생성 시 필요)")
-    print("  --langs LANGS      : 번역할 언어 코드 (쉼표로 구분, 기본값: ko)")
-    print("  --no-backup        : 백업 건너뛰기")
-    print("  --cursor-path PATH : Cursor 설치 경로 수동 지정")
-    print("  --extract-only     : 텍스트만 추출하고 번역은 건너뛰기")
-    print("  --view-only        : 기존 번역만 표시 (추출/번역 건너뛰기)")
-    print("\n지원 언어:")
-    print("  ko: 한국어, ja: 일본어, zh: 중국어, fr: 프랑스어, de: 독일어,")
-    print("  es: 스페인어, it: 이탈리아어, pt: 포르투갈어, ru: 러시아어")
-    print("\n예시:")
-    print("  # 설치된 Cursor에서 한국어 번역 파일 생성 (API 키 사용)")
-    print("  python main.py --api-key YOUR_DEEPL_API_KEY")
-    print("\n  # 여러 언어 번역 생성")
-    print("  python main.py --api-key YOUR_DEEPL_API_KEY --langs ko,ja,zh")
-    print("\n  # 텍스트만 추출")
-    print("  python main.py --extract-only")
-    print("\n  # 기존 번역 파일 확인")
-    print("  python main.py --view-only")
+def extract_and_translate(cursor_path, target_lang, api_key=None, test_mode=False):
+    """텍스트 추출 및 번역"""
+    if test_mode:
+        # 테스트 모드: 샘플 데이터 생성
+        logger.info("테스트 모드로 실행합니다.")
+        extractor = CursorExtractor("dummy_path")
+        strings_file = extractor.generate_sample_strings()
+        template_file = extractor.generate_translation_template()
+    else:
+        # 실제 데이터 추출
+        if not cursor_path:
+            logger.error("Cursor 설치 경로가 지정되지 않았습니다.")
+            return False
+            
+        js_file_path = find_main_js_file(Path(cursor_path))
+        if not js_file_path:
+            logger.error("workbench.desktop.main.js 파일을 찾을 수 없습니다.")
+            return False
+            
+        extractor = CursorExtractor(js_file_path)
+        strings_file = extractor.extract_strings()
+        template_file = extractor.generate_translation_template()
+    
+    # 번역 실행
+    output_file = f"cursor_translations_{target_lang.lower()}.json"
+    translator = DeepLTranslator(api_key)
+    
+    translated, total = translator.update_translation_json(template_file, output_file, target_lang)
+    logger.info(f"번역 완료: {translated}/{total} 항목이 번역되었습니다.")
+    logger.info(f"번역 파일이 저장되었습니다: {output_file}")
+    
+    return True
+
+def list_backups():
+    """백업 목록 표시"""
+    backup_dir = Path.home() / '.cursor_translator' / 'backups'
+    
+    if not backup_dir.exists():
+        logger.info("백업 디렉토리가 없습니다.")
+        return []
+    
+    backups = list(backup_dir.glob("workbench.desktop.main.js.*"))
+    backups.sort(reverse=True)  # 최신 백업이 먼저 오도록 정렬
+    
+    if not backups:
+        logger.info("백업 파일이 없습니다.")
+    else:
+        logger.info(f"총 {len(backups)}개의 백업 파일:")
+        for i, backup in enumerate(backups):
+            timestamp = backup.name.split('.')[-1]
+            try:
+                date = datetime.strptime(timestamp, "%Y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+                logger.info(f"{i+1}. {date} - {backup}")
+            except:
+                logger.info(f"{i+1}. {backup}")
+    
+    return backups
+
+def main():
+    parser = argparse.ArgumentParser(description='Cursor IDE 다국어 번역 도구')
+    
+    # 기본 옵션
+    parser.add_argument('--cursor-path', help='Cursor 설치 경로')
+    parser.add_argument('--api-key', help='DeepL API 키')
+    parser.add_argument('--target-lang', default='ko', help='대상 언어 코드 (기본값: ko)')
+    parser.add_argument('--test-mode', action='store_true', help='테스트 모드')
+    
+    # 동작 모드
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument('--extract', action='store_true', help='텍스트 추출')
+    mode_group.add_argument('--translate', action='store_true', help='번역 적용')
+    mode_group.add_argument('--restore', action='store_true', help='백업에서 복원')
+    mode_group.add_argument('--list-backups', action='store_true', help='백업 목록 표시')
+    
+    # 백업 관련 옵션
+    parser.add_argument('--no-backup', action='store_true', help='백업 건너뛰기')
+    parser.add_argument('--backup-index', type=int, help='복원할 백업 인덱스 (--list-backups로 확인)')
+    
+    args = parser.parse_args()
+    
+    # API 키는 환경 변수에서도 가져올 수 있음
+    api_key = args.api_key or os.environ.get('DEEPL_API_KEY')
+    
+    # Cursor 경로 찾기
+    cursor_path = args.cursor_path
+    if not cursor_path and not args.test_mode:
+        finder = CursorFinder()
+        cursor_path = finder.find_cursor_installation()
+        if cursor_path:
+            logger.info(f"Cursor 설치 경로: {cursor_path}")
+        else:
+            logger.warning("Cursor 설치 경로를 찾을 수 없습니다. --cursor-path 옵션으로 직접 지정하세요.")
+            if not args.list_backups:  # 백업 목록 표시는 Cursor 경로가 필요 없음
+                return
+    
+    # 명령 처리
+    if args.list_backups:
+        list_backups()
+        return
+        
+    elif args.restore:
+        backups = list_backups()
+        if not backups:
+            return
+        
+        backup_index = args.backup_index
+        if backup_index is None:
+            backup_index = int(input("복원할 백업 번호를 입력하세요: "))
+        
+        if 1 <= backup_index <= len(backups):
+            selected_backup = backups[backup_index - 1]
+            
+            if not cursor_path:
+                logger.error("복원을 위해 Cursor 설치 경로가 필요합니다.")
+                return
+                
+            js_file_path = find_main_js_file(Path(cursor_path))
+            if not js_file_path:
+                logger.error("workbench.desktop.main.js 파일을 찾을 수 없습니다.")
+                return
+                
+            restore_backup(selected_backup, js_file_path)
+        else:
+            logger.error(f"유효하지 않은 백업 인덱스: {backup_index}")
+        return
+        
+    elif args.extract:
+        extract_and_translate(cursor_path, args.target_lang, api_key, args.test_mode)
+        return
+        
+    elif args.translate:
+        if not cursor_path and not args.test_mode:
+            logger.error("번역 적용을 위해 Cursor 설치 경로가 필요합니다.")
+            return
+            
+        translation_file = f"cursor_translations_{args.target_lang.lower()}.json"
+        if not os.path.exists(translation_file):
+            logger.error(f"번역 파일이 존재하지 않습니다: {translation_file}")
+            logger.info("먼저 --extract 옵션으로 번역 파일을 생성하세요.")
+            return
+        
+        if args.test_mode:
+            logger.info(f"테스트 모드: 번역 파일 {translation_file}의 내용 확인")
+            with open(translation_file, 'r', encoding='utf-8') as f:
+                translations = json.load(f)
+            logger.info(f"총 {len(translations)}개 항목, 번역된 항목: {sum(1 for v in translations.values() if v)}")
+            return
+            
+        js_file_path = find_main_js_file(Path(cursor_path))
+        if not js_file_path:
+            logger.error("workbench.desktop.main.js 파일을 찾을 수 없습니다.")
+            return
+            
+        apply_translations(js_file_path, translation_file, not args.no_backup)
+        return
+    
+    # 기본 동작: 추출 및 번역 
+    extract_and_translate(cursor_path, args.target_lang, api_key, args.test_mode)
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ('-h', '--help'):
-        show_usage()
-    else:
         main()
